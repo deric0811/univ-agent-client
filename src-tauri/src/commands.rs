@@ -1,9 +1,10 @@
-use std::{fs, path::Path, process::Command, time::Duration};
+use std::{fs, path::Path, time::Duration};
 
 use crate::projects::{self, validate_project_id};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_shell::ShellExt;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -96,47 +97,42 @@ fn access_token(state: &State<'_, AuthState>) -> Result<String, String> {
         .ok_or_else(|| "로그인이 필요합니다.".to_string())
 }
 
-// Run blocking FFmpeg work off the window's main thread.
-#[tauri::command(async)]
-pub fn extract_audio_ffmpeg(app: AppHandle, video_path: String) -> Result<String, String> {
+// Extract audio from the bundled FFmpeg sidecar without depending on a
+// system-installed ffmpeg. The sidecar runs asynchronously so the UI thread
+// never blocks while the audio is being encoded.
+#[tauri::command]
+pub async fn extract_audio_ffmpeg(app: AppHandle, video_path: String) -> Result<String, String> {
     let cache_dir = app
         .path()
         .app_cache_dir()
-        .map_err(|error| format!("Failed to resolve the app cache directory: {error}"))?;
-    fs::create_dir_all(&cache_dir).map_err(|error| {
-        format!(
-            "Failed to create the app cache directory '{}': {error}",
-            cache_dir.display()
-        )
-    })?;
+        .map_err(|error| format!("캐시 디렉터리 접근 실패: {error}"))?;
+    fs::create_dir_all(&cache_dir).map_err(|error| format!("캐시 디렉터리 생성 실패: {error}"))?;
 
     let output_path = cache_dir.join(format!("{}.mp3", Uuid::new_v4()));
-    let output_path_string = output_path
-        .to_str()
-        .ok_or_else(|| "The audio output path is not valid UTF-8".to_string())?
-        .to_owned();
+    let output_path_string = output_path.to_string_lossy().to_string();
 
-    let output = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(&video_path)
+    // The sidecar identifier is the bare binary name, not a path: Tauri
+    // resolves "univ-ffmpeg" to the target-specific binary in bundle.externalBin.
+    let sidecar_command = app
+        .shell()
+        .sidecar("univ-ffmpeg")
+        .map_err(|error| format!("FFmpeg 사이드카 초기화 실패: {error}"))?;
+
+    let output = sidecar_command
+        .args(["-y", "-i", video_path.as_str()])
         .args([
             "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k", "-f", "mp3",
         ])
         .arg(&output_path)
         .output()
-        .map_err(|error| {
-            format!(
-                "Failed to execute ffmpeg; ensure it is installed and available on PATH: {error}"
-            )
-        })?;
+        .await
+        .map_err(|error| format!("FFmpeg 실행 실패: {error}"))?;
 
     if !output.status.success() {
         // Do not leave a partial audio file behind after an encoding failure.
         let _ = fs::remove_file(&output_path);
         return Err(format!(
-            "FFmpeg audio extraction failed ({}): {}",
-            output.status,
+            "FFmpeg 변환 오류: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
