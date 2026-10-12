@@ -17,9 +17,11 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-fs": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2",
     "dompurify": "^3.4.15",
-    "marked": "^18.0.13"
+    "marked": "^18.0.13",
+    "pdf-lib": "^1.17.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.10",

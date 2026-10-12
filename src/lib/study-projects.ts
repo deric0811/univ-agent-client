@@ -5,6 +5,12 @@ export interface StudyProjectMeta {
   title: string;
   created_at: string;
   video_path: string;
+  course?: string;
+  chapter?: string;
+  /** 다중 영상 프로젝트의 전체 영상 경로(입력 순서) */
+  video_paths?: string[];
+  /** 다중 영상 프로젝트의 영상별 재생시간(초, 입력 순서) */
+  video_durations?: number[];
   [key: string]: unknown;
 }
 
@@ -55,8 +61,38 @@ export async function loadStudyProject(projectId: string): Promise<StudyProject>
   return { meta, markdown: project.markdown };
 }
 
+export async function deleteStudyProject(projectId: string): Promise<void> {
+  await invoke("delete_study_project", { projectId });
+}
+
+export async function renameStudyProject(
+  projectId: string,
+  newTitle: string,
+  course?: string,
+  chapter?: string,
+): Promise<void> {
+  await invoke("rename_study_project", { projectId, newTitle, course, chapter });
+}
+
+export async function openProjectFolder(projectId: string): Promise<void> {
+  await invoke("open_project_folder", { projectId });
+}
+
 export function videoFilename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) || "제목 없는 강의";
+}
+
+/**
+ * 서재에 저장된 강의들의 과목명을 공백 정리 후 중복 없이 모아 사전순으로 돌려준다.
+ * 신규 강의 등록 시 기존 표기와 어긋나지 않도록 선택 목록으로 사용한다.
+ */
+export function uniqueCourseNames(projects: StudyProjectMeta[]): string[] {
+  const names = new Set<string>();
+  for (const project of projects) {
+    const course = (project.course ?? "").trim();
+    if (course) names.add(course);
+  }
+  return Array.from(names).sort((left, right) => left.localeCompare(right, "ko"));
 }
 
 export function formatCreatedAt(value: string): string {

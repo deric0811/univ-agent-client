@@ -11,6 +11,7 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .manage(commands::AuthState(Default::default()))
+        .manage(commands::MergeProcessState::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
@@ -22,12 +23,20 @@ pub fn run() {
             commands::logout,
             commands::is_authenticated,
             commands::extract_audio_ffmpeg,
+            commands::extract_and_merge_audio_from_videos,
             commands::upload_job,
             commands::get_job_status,
             commands::get_job_result,
             commands::save_study_project,
+            commands::cleanup_temp_files,
             commands::list_study_projects,
-            commands::load_study_project
+            commands::load_study_project,
+            commands::delete_study_project,
+            commands::rename_study_project,
+            commands::open_project_folder,
+            commands::open_file_in_folder,
+            commands::concat_videos_ffmpeg,
+            commands::cancel_merge_video
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

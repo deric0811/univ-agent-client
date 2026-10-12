@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { listStudyProjects, loadStudyProject, videoFilename, formatCreatedAt } from "./study-projects";
+import { listStudyProjects, loadStudyProject, uniqueCourseNames, videoFilename, formatCreatedAt } from "./study-projects";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const invokeMock = vi.mocked(invoke);
@@ -57,4 +57,17 @@ it("uses Unix and Windows video filenames as fallback titles", () => {
 
 it("handles missing legacy creation dates", () => {
   expect(formatCreatedAt("")).toBe("생성일 정보 없음");
+});
+
+it("collects unique trimmed course names for autocomplete", () => {
+  const projects = [
+    { ...meta, project_id: "1", course: "클라우드 컴퓨팅" },
+    { ...meta, project_id: "2", course: " cloudComputing " },
+    { ...meta, project_id: "3", course: "클라우드 컴퓨팅" },
+    { ...meta, project_id: "4" },
+    { ...meta, project_id: "5", course: "   " },
+    { ...meta, project_id: "6", course: "알고리즘" },
+  ];
+  expect(uniqueCourseNames(projects)).toEqual(["알고리즘", "클라우드 컴퓨팅", "cloudComputing"]);
+  expect(uniqueCourseNames([])).toEqual([]);
 });

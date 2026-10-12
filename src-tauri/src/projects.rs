@@ -13,6 +13,10 @@ pub struct StudyProjectMeta {
     pub created_at: String,
     #[serde(default)]
     pub video_path: String,
+    #[serde(default)]
+    pub course: String,
+    #[serde(default)]
+    pub chapter: String,
     // Preserve M2 fields (job_id, pdf_path, timestamps, schema_version, etc.).
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

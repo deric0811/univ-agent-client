@@ -4,23 +4,56 @@
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { formatCreatedAt, type StudyProject } from "$lib/study-projects";
   import { summaryMarkdown } from "$lib/summary-markdown";
+  import { resolveVideoSegment, type VideoSegment } from "$lib/video-playback";
 
   let { project, onback }: { project: StudyProject; onback: () => void } = $props();
   let videoElement = $state<HTMLVideoElement>();
   let currentTime = $state(0);
   let pendingSeek = $state<number | null>(null);
+  let activeVideoIndex = $state(0);
   let playerError = $state("");
   let linkError = $state("");
   let disposed = false;
   let seekVersion = 0;
-  const videoSrc = $derived(project.meta.video_path ? convertFileSrc(project.meta.video_path) : "");
+
+  const videoPaths = $derived.by(() => {
+    const paths = project.meta.video_paths;
+    if (Array.isArray(paths) && paths.length > 0) {
+      return paths.filter(
+        (path): path is string => typeof path === "string" && path.trim().length > 0,
+      );
+    }
+    return project.meta.video_path ? [project.meta.video_path] : [];
+  });
+  const videoDurations = $derived.by(() =>
+    Array.isArray(project.meta.video_durations)
+      ? project.meta.video_durations.filter((value): value is number => typeof value === "number")
+      : [],
+  );
+  const hasSegmentDurations = $derived(
+    videoPaths.length > 0 &&
+      videoDurations.length >= videoPaths.length &&
+      videoPaths.every((_, index) => videoDurations[index] > 0),
+  );
+  const activeVideoPath = $derived(videoPaths[activeVideoIndex] ?? "");
+  const videoSrc = $derived(activeVideoPath ? convertFileSrc(activeVideoPath) : "");
+  // 요약 하이라이트용 통합 재생 시각. 단일 영상이면 로컬 시각과 같다.
+  const globalCurrentTime = $derived.by(() => {
+    if (!hasSegmentDurations || activeVideoIndex === 0) return currentTime;
+    let offset = 0;
+    for (let index = 0; index < activeVideoIndex; index += 1) {
+      offset += videoDurations[index];
+    }
+    return offset + currentTime;
+  });
 
   onDestroy(() => {
     disposed = true;
     videoElement?.pause();
   });
 
-  async function seekTo(seconds: number) {
+  /** 현재 활성 영상 안에서 localSeconds 위치로 이동해 재생한다. */
+  async function seekLocal(seconds: number) {
     const version = ++seekVersion;
     const video = videoElement;
     if (!video) {
@@ -53,8 +86,45 @@
     }
   }
 
+  /** 통합 타임스탬프를 올바른 영상과 로컬 시점으로 변환해 재생한다. */
+  async function seekTo(targetSeconds: number) {
+    if (!Number.isFinite(targetSeconds) || targetSeconds < 0) return;
+    if (videoPaths.length === 0) {
+      playerError = "이 강의에는 원본 비디오 경로가 없습니다.";
+      return;
+    }
+    if (!hasSegmentDurations || videoPaths.length === 1) {
+      await seekLocal(targetSeconds);
+      return;
+    }
+    let segment: VideoSegment;
+    try {
+      segment = resolveVideoSegment(targetSeconds, videoPaths, videoDurations);
+    } catch (error) {
+      if (!disposed) {
+        playerError = `타임스탬프를 영상으로 변환하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      return;
+    }
+    if (segment.videoIndex !== activeVideoIndex) {
+      // src 교체 후 loadedmetadata에서 pendingSeek 위치로 이동해 재생한다.
+      playerError = "";
+      pendingSeek = segment.localSeconds;
+      activeVideoIndex = segment.videoIndex;
+      return;
+    }
+    await seekLocal(segment.localSeconds);
+  }
+
   function onMetadata() {
-    if (pendingSeek !== null) void seekTo(pendingSeek);
+    if (pendingSeek !== null) void seekLocal(pendingSeek);
+  }
+
+  function onEnded() {
+    // 다음 파트가 있으면 0초부터 이어서 재생한다.
+    if (activeVideoIndex + 1 >= videoPaths.length) return;
+    pendingSeek = 0;
+    activeVideoIndex += 1;
   }
 
   function onVideoError() {
@@ -93,12 +163,16 @@
           bind:this={videoElement}
           onloadedmetadata={onMetadata}
           ontimeupdate={() => { currentTime = videoElement?.currentTime ?? 0; }}
+          onended={onEnded}
           onerror={onVideoError}
         >브라우저가 비디오 재생을 지원하지 않습니다.</video>
       {:else}
         <p class="notice">원본 비디오 경로가 없는 프로젝트입니다. 요약은 계속 읽을 수 있습니다.</p>
       {/if}
-      <p class="path">{project.meta.video_path}</p>
+      <p class="path">{activeVideoPath}</p>
+      {#if videoPaths.length > 1}
+        <p class="muted">Part {activeVideoIndex + 1} / {videoPaths.length} · 다음 파트로 자동 이어 재생됩니다.</p>
+      {/if}
       <p class="muted">오른쪽 요약의 시간 버튼을 누르면 해당 장면으로 이동합니다.</p>
       {#if pendingSeek !== null}<p role="status">영상 정보를 불러온 뒤 선택한 시점으로 이동합니다...</p>{/if}
       {#if playerError}<p class="error" role="alert">{playerError}</p>{/if}
@@ -109,7 +183,7 @@
       {#if !project.markdown.trim()}<p class="muted">저장된 요약 내용이 없습니다.</p>{/if}
       <div
         class="markdown"
-        use:summaryMarkdown={{ markdown: project.markdown, currentTime, onTimestamp: seekTo, onLink: openLink }}
+        use:summaryMarkdown={{ markdown: project.markdown, currentTime: globalCurrentTime, onTimestamp: seekTo, onLink: openLink }}
       ></div>
     </section>
   </div>

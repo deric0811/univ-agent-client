@@ -10,6 +10,18 @@
     "opener:default",
     "dialog:default",
     "fs:default",
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "**" }]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [{ "path": "$APPCACHE" }, { "path": "$APPCACHE/**" }]
+    },
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [{ "path": "$APPCACHE" }, { "path": "$APPCACHE/**" }]
+    },
     "process:default"
   ]
 }
