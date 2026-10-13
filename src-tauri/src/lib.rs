@@ -20,6 +20,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             commands::login,
+            commands::login_school_key,
+            commands::list_models,
             commands::logout,
             commands::is_authenticated,
             commands::extract_audio_ffmpeg,

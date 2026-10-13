@@ -32,6 +32,7 @@ const openMock = vi.mocked(open);
 const localId = "550e8400-e29b-41d4-a716-446655440000";
 const meta = { project_id: "saved-project", title: "이전 강의", created_at: "2026-09-18T00:00:00Z", video_path: "/videos/previous.mp4" };
 const markdown = "# 강의 요약\n\n[03:25] 핵심 개념\n\n[01:20:15] 마무리";
+let savedMetaJson = "";
 let component: ReturnType<typeof mount> | undefined;
 let target: HTMLElement;
 
@@ -44,22 +45,36 @@ function button(text: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
+  savedMetaJson = "";
   invokeMock.mockReset();
   openMock.mockReset();
   vi.mocked(convertFileSrc).mockClear();
   vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.stubGlobal("crypto", { randomUUID: () => localId });
-  invokeMock.mockImplementation(async (command) => {
+  invokeMock.mockImplementation(async (command, args) => {
     switch (command) {
       case "is_authenticated": return true;
       case "list_study_projects": return JSON.stringify([meta]);
-      case "load_study_project": return JSON.stringify({ meta, markdown });
+      case "list_models": return JSON.stringify([
+        { id: "gpt-5.6-luna", name: "gpt-5.6-luna", owned_by: "openai" },
+        { id: "claude-x", name: "claude-x", owned_by: "anthropic" },
+      ]);
+      case "load_study_project": {
+        const requested = (args as { projectId?: string } | undefined)?.projectId;
+        if (requested === localId && savedMetaJson) {
+          // 디스크에 저장된 최신 메타를 그대로 돌려준다.
+          return JSON.stringify({ meta: { ...JSON.parse(savedMetaJson), reloaded_from_disk: true }, markdown });
+        }
+        return JSON.stringify({ meta, markdown });
+      }
       case "extract_and_merge_audio_from_videos": return { audioPath: "/cache/merged_audio.wav", videoDurations: [3600] };
       case "upload_job": return JSON.stringify({ job_id: "job-1", status: "queued", waiting_count: 1 });
       case "get_job_status": return JSON.stringify({ job_id: "job-1", status: "completed", waiting_count: 0, error_message: null });
       case "get_job_result": return JSON.stringify({ job_id: "job-1", status: "completed", content: markdown, timestamps: [{ seconds: 205, label: "03:25" }] });
-      case "save_study_project": return `/data/projects/${localId}`;
+      case "save_study_project":
+        savedMetaJson = (args as { metadataJson: string }).metadataJson;
+        return `/data/projects/${localId}`;
       case "cleanup_temp_files": return undefined;
       default: throw new Error(`Unexpected command: ${command}`);
     }
@@ -128,8 +143,10 @@ describe("M2 → M3/M4", () => {
 
     const commands = invokeMock.mock.calls
       .map(([command]) => command)
-      .filter((command) => !["is_authenticated", "list_study_projects"].includes(command));
-    expect(commands).toEqual(["extract_and_merge_audio_from_videos", "upload_job", "get_job_status", "get_job_result", "save_study_project", "cleanup_temp_files"]);
+      .filter((command) => !["is_authenticated", "list_study_projects", "list_models"].includes(command));
+    expect(commands).toEqual(["extract_and_merge_audio_from_videos", "upload_job", "get_job_status", "get_job_result", "save_study_project", "load_study_project", "cleanup_temp_files"]);
+    // 저장 직후 디스크의 최신 메타를 다시 읽어 뷰어에 반영한다.
+    expect(invokeMock).toHaveBeenCalledWith("load_study_project", { projectId: localId });
     const args = invokeMock.mock.calls.find(([command]) => command === "save_study_project")![1] as Record<string, string>;
     expect(JSON.parse(args.metadataJson)).toMatchObject({
       project_id: localId, title: title || "lecture.mp4", video_path: "/videos/lecture.mp4", pdf_path: "/notes/lecture.pdf",
@@ -333,5 +350,109 @@ describe("M2 → M3/M4", () => {
 
     const args = invokeMock.mock.calls.find(([command]) => command === "save_study_project")![1] as Record<string, string>;
     expect(JSON.parse(args.metadataJson).course).toBe("클라우드 컴퓨팅");
+  });
+
+  it("runs a document-only analysis when only PDFs are provided", async () => {
+    openMock.mockResolvedValueOnce(["/notes/one.pdf", "/notes/two.pdf"]);
+    button("PDF 파일 추가").click();
+    await vi.waitFor(() => expect(target.querySelectorAll(".media-list li")).toHaveLength(2));
+
+    button("분석 시작").click();
+    await vi.waitFor(() => expect(target.querySelector("#viewer-title")?.textContent).toBe("one.pdf"));
+
+    // 문서 전용이므로 오디오 추출/청크 업로드를 건너뛴다.
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "extract_and_merge_audio_from_videos"),
+    ).toBe(false);
+    const upload = invokeMock.mock.calls.find(([command]) => command === "upload_job")![1] as {
+      audioPath: string | null;
+      pdfPath: string;
+    };
+    expect(upload.audioPath).toBeNull();
+    expect(upload.pdfPath).toBe(`/cache/merged_lecture_${localId}.pdf`);
+
+    const args = invokeMock.mock.calls.find(([command]) => command === "save_study_project")![1] as Record<string, string>;
+    const metadata = JSON.parse(args.metadataJson);
+    expect(metadata.document_only).toBe(true);
+    expect(metadata.video_path).toBeNull();
+    expect(metadata.video_paths).toEqual([]);
+    expect(metadata.video_durations).toEqual([]);
+    expect(metadata.pdf_paths).toEqual(["/notes/one.pdf", "/notes/two.pdf"]);
+
+    // 문서 전용 뷰어: 비디오 플레이어 없이 배지와 요약이 보인다.
+    expect(target.textContent).toContain("문서 전용 강의 (영상 없음)");
+    expect(target.querySelector("video")).toBeNull();
+    const cleanup = invokeMock.mock.calls.find(([command]) => command === "cleanup_temp_files")![1] as {
+      paths: string[];
+    };
+    expect(cleanup.paths).toEqual([`/cache/merged_lecture_${localId}.pdf`]);
+  });
+
+  it("opens a document-only project without a video player", async () => {
+    const docMeta = {
+      ...meta,
+      project_id: "doc-project",
+      title: "문서 전용 강의",
+      video_path: null,
+      video_paths: [],
+      video_durations: [],
+      pdf_path: "/notes/slides.pdf",
+      pdf_paths: ["/notes/slides.pdf"],
+    };
+    const original = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (...args) => {
+      if (args[0] === "list_study_projects") return JSON.stringify([docMeta]);
+      if (args[0] === "load_study_project") {
+        return JSON.stringify({ meta: docMeta, markdown: "# 문서 요약" });
+      }
+      return original(...args);
+    });
+
+    button("내 강의 서재").click();
+    await vi.waitFor(() =>
+      expect(target.querySelector(".project-main")?.textContent).toContain("문서 전용 강의"),
+    );
+    target.querySelector<HTMLButtonElement>(".project-main")!.click();
+    await vi.waitFor(() =>
+      expect(target.querySelector("#viewer-title")?.textContent).toBe("문서 전용 강의"),
+    );
+
+    expect(target.textContent).toContain("문서 전용 강의 (영상 없음)");
+    expect(target.querySelector("video")).toBeNull();
+    expect(target.querySelector(".pdf-frame")).not.toBeNull();
+    expect(convertFileSrc).toHaveBeenCalledWith("/notes/slides.pdf");
+  });
+
+  it("renders fetched models and sends the chosen model and analysis mode", async () => {
+    await vi.waitFor(() =>
+      expect(target.querySelectorAll("#analysis-model option")).toHaveLength(2),
+    );
+    const select = target.querySelector<HTMLSelectElement>("#analysis-model")!;
+    expect(select.value).toBe("gpt-5.6-luna");
+    select.value = "claude-x";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    button("시험 대비 문제").click();
+    flushSync();
+
+    await chooseFiles();
+    button("분석 시작").click();
+    await vi.waitFor(() => expect(target.querySelector("#viewer-title")).not.toBeNull());
+
+    const upload = invokeMock.mock.calls.find(([command]) => command === "upload_job")![1] as {
+      model: string;
+      analysisMode: string;
+      metadataJson: string;
+    };
+    expect(upload.model).toBe("claude-x");
+    expect(upload.analysisMode).toBe("quiz");
+    expect(JSON.parse(upload.metadataJson)).toMatchObject({ model: "claude-x", analysis_mode: "quiz" });
+
+    const saved = invokeMock.mock.calls.find(([command]) => command === "save_study_project")![1] as Record<string, string>;
+    expect(JSON.parse(saved.metadataJson)).toMatchObject({ model: "claude-x", analysis_mode: "quiz" });
+    // 뷰어는 디스크에서 다시 읽은 메타를 사용한다.
+    expect(target.querySelector("[data-testid='legal-notice']")).not.toBeNull();
+    expect(target.querySelector("[data-testid='legal-notice']")?.textContent).toContain("학습 참고용 안내");
+    expect(target.querySelector("[data-testid='legal-notice']")?.textContent).toContain("저작권 안내");
+    expect(target.querySelector("[data-testid='meta-badge']")?.textContent).toBe("[시험 대비 문제 | claude-x]");
   });
 });

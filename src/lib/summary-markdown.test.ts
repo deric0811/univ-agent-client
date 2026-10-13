@@ -29,6 +29,13 @@ describe("safe Markdown rendering", () => {
     expect(buttons[0].getAttribute("aria-label")).toContain("시점으로 이동");
   });
 
+  it("makes backend-style [file.json - HH:MM:SS] citations clickable", () => {
+    const fragment = renderSummary("설명입니다 [lecture_part1.json - 00:14:20] 끝");
+    const button = fragment.querySelector<HTMLButtonElement>("button")!;
+    expect(button.dataset.seconds).toBe("860");
+    expect(button.textContent).toBe("[lecture_part1.json - 00:14:20]");
+  });
+
   it("does not replace timestamps in code, link attributes, or nested anchors", () => {
     const fragment = renderSummary('`[00:30]`\n\n```text\n[01:00]\n```\n\n<a href="https://example.com" title="[01:20]">[00:50]</a>\n\n[03:25]');
     expect(fragment.querySelectorAll("button")).toHaveLength(1);

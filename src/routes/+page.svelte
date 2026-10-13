@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { get } from "svelte/store";
   import { invoke } from "@tauri-apps/api/core";
   import { appCacheDir, join } from "@tauri-apps/api/path";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -15,13 +16,31 @@
   import StudyProjectViewer from "$lib/components/StudyProjectViewer.svelte";
   import ProjectCard from "$lib/components/ProjectCard.svelte";
   import ToolsView from "$lib/components/ToolsView.svelte";
+  import NoticeAndSupportModal from "$lib/components/NoticeAndSupportModal.svelte";
   import MediaFileList from "$lib/components/MediaFileList.svelte";
-  import { appendMediaFiles, moveWithin, type MediaFile } from "$lib/media-files";
+  import { appendMediaFiles, isPptPath, moveWithin, type MediaFile } from "$lib/media-files";
   import {
     listStudyProjects, loadStudyProject, parseProjectMeta, uniqueCourseNames, videoFilename,
     type StudyProject, type StudyProjectMeta,
   } from "$lib/study-projects";
+  import {
+    ANALYSIS_MODE_OPTIONS,
+    loadModels,
+    modelsError,
+    models,
+    pickDefaultModel,
+    type AnalysisMode,
+  } from "$lib/models-store";
+  import {
+    SCHOOL_DISPLAY_NAME,
+    clearSessionProfile,
+    loadSessionProfile,
+    saveSessionProfile,
+  } from "$lib/auth-store";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { SERVER_DOWN_MESSAGE, isServerUnavailable } from "$lib/server-status";
   import { subscribeToVideoMergeProgress } from "$lib/stores/videoMergeStore";
+  import { audioUploadProgress, subscribeToAudioUploadProgress } from "$lib/upload-progress";
 
   type Phase =
     | "IDLE"
@@ -39,11 +58,21 @@
   let loginPassword = $state("");
   let loginLoading = $state(false);
   let loginError = $state("");
+  let loginMode = $state<"school" | "account">("school");
+  let schoolApiKey = $state("");
+  let schoolLoginLoading = $state(false);
+  let schoolLoginError = $state("");
+  let showSchoolKey = $state(false);
+  let pptWarning = $state("");
+  let noticeModalOpen = $state(false);
+  let serverDownNotice = $state("");
   let videos = $state<MediaFile[]>([]);
   let pdfs = $state<MediaFile[]>([]);
   let lectureTitle = $state("");
   let lectureCourse = $state("");
   let lectureChapter = $state("");
+  let selectedModel = $state("");
+  let analysisMode = $state<AnalysisMode>("summary");
   let mode = $state<"analysis" | "library" | "tools">("analysis");
   let projects = $state<StudyProjectMeta[]>([]);
   let selectedProject = $state<StudyProject | null>(null);
@@ -54,6 +83,7 @@
   let refreshVersion = 0;
   let openVersion = 0;
   let phase = $state<Phase>("IDLE");
+  let documentMode = $state(false);
   let selecting = $state(false);
   let job = $state<JobStatusResponse | null>(null);
   let markdown = $state<string | null>(null);
@@ -68,6 +98,7 @@
   let zoomToastVisible = $state(false);
   let zoomToastTimer: ReturnType<typeof setTimeout> | null = null;
   let mergeProgressUnsubscribe: (() => void) | null = null;
+  let audioUploadUnsubscribe: (() => void) | null = null;
   let externalDropUnsubscribe: (() => void) | null = null;
   let destroyed = false;
 
@@ -109,14 +140,22 @@
   );
   // 기존 강의들의 과목명을 중복 없이 모아 과목명 입력의 추천 목록으로 제공한다.
   const courseOptions = $derived(uniqueCourseNames(projects));
+  const activeModelId = $derived(pickDefaultModel($models, selectedModel));
+  const selectedModeLabel = $derived(
+    ANALYSIS_MODE_OPTIONS.find((option) => option.value === analysisMode)?.label ?? "분석",
+  );
   const statusMessage = $derived.by(() => {
+    // 문서 전용 모드에서는 STT 없이 요약만 진행된다는 점을 명확히 안내한다.
+    if (documentMode && (phase === "UPLOADING" || phase === "POLLING")) {
+      return "문서 분석 모드: 음성 인식을 건너뛰고 강의자료 요약 중...";
+    }
     switch (phase) {
       case "IDLE":
         return "강의 영상과 PDF를 선택한 후 분석을 시작하세요.";
       case "EXTRACTING_AUDIO":
         return "오디오 추출 중... (16kHz · 모노 · WAV)";
       case "UPLOADING":
-        return "강의 오디오 및 자료 백엔드 전송 중...";
+        return $audioUploadProgress?.message ?? "강의 오디오 및 자료 백엔드 전송 중...";
       case "POLLING":
         switch (job?.status) {
           case "queued":
@@ -124,7 +163,7 @@
           case "transcribing":
             return "음성 인식 및 타임스탬프 추출 중 (Faster-Whisper)...";
           case "summarizing":
-            return "Gemini 2.5 Pro 기반 핵심 강의 요약 생성 중...";
+            return `${activeModelId} 기반 ${selectedModeLabel} 생성 중...`;
           case "completed":
             return "분석 완료: 결과를 가져오는 중...";
           case "failed":
@@ -145,6 +184,7 @@
     void checkAuthentication();
     window.addEventListener("keydown", handleKeydown);
     mergeProgressUnsubscribe = subscribeToVideoMergeProgress();
+    audioUploadUnsubscribe = subscribeToAudioUploadProgress();
     void registerExternalDrop();
   });
 
@@ -154,6 +194,8 @@
     window.removeEventListener("keydown", handleKeydown);
     mergeProgressUnsubscribe?.();
     mergeProgressUnsubscribe = null;
+    audioUploadUnsubscribe?.();
+    audioUploadUnsubscribe = null;
     externalDropUnsubscribe?.();
     externalDropUnsubscribe = null;
     if (zoomToastTimer) clearTimeout(zoomToastTimer);
@@ -167,20 +209,30 @@
     try {
       const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type !== "drop") return;
-        const dropped = event.payload.paths ?? [];
-        const droppedVideos = dropped.filter((path) =>
-          VIDEO_EXTENSIONS.some((extension) => path.toLowerCase().endsWith(extension)),
-        );
-        const droppedPdfs = dropped.filter((path) => path.toLowerCase().endsWith(".pdf"));
-        if (droppedVideos.length > 0 || droppedPdfs.length > 0) resetAnalysis();
-        if (droppedVideos.length > 0) videos = appendMediaFiles(videos, droppedVideos);
-        if (droppedPdfs.length > 0) pdfs = appendMediaFiles(pdfs, droppedPdfs);
+        handleDroppedPaths(event.payload.paths ?? []);
       });
       if (destroyed) unlisten();
       else externalDropUnsubscribe = unlisten;
     } catch {
       // 드래그&드롭을 지원하지 않는 환경에서는 무시한다.
     }
+  }
+
+  const PPT_WARNING =
+    "PPT/PPTX 파일은 직접 등록할 수 없습니다. PowerPoint에서 [다른 이름으로 저장 > PDF]로 변환 후 업로드해 주세요.";
+
+  /** 떨어뜨린 경로 중 지원 형식만 등록하고, PPT/PPTX는 차단·경고한다. */
+  function handleDroppedPaths(paths: string[]) {
+    if (paths.some(isPptPath)) {
+      pptWarning = PPT_WARNING;
+    }
+    const droppedVideos = paths.filter((path) =>
+      VIDEO_EXTENSIONS.some((extension) => path.toLowerCase().endsWith(extension)),
+    );
+    const droppedPdfs = paths.filter((path) => path.toLowerCase().endsWith(".pdf"));
+    if (droppedVideos.length > 0 || droppedPdfs.length > 0) resetAnalysis();
+    if (droppedVideos.length > 0) videos = appendMediaFiles(videos, droppedVideos);
+    if (droppedPdfs.length > 0) pdfs = appendMediaFiles(pdfs, droppedPdfs);
   }
 
   function isEditableTarget(target: EventTarget | null): boolean {
@@ -195,6 +247,15 @@
     zoomToastVisible = true;
     if (zoomToastTimer) clearTimeout(zoomToastTimer);
     zoomToastTimer = setTimeout(() => { zoomToastVisible = false; }, 1_200);
+  }
+
+  async function toggleFullscreen() {
+    try {
+      const appWindow = getCurrentWindow();
+      await appWindow.setFullscreen(!(await appWindow.isFullscreen()));
+    } catch {
+      // Tauri 창이 없는 환경(테스트/브라우저)에서는 무시한다.
+    }
   }
 
   function handleZoomShortcut(event: KeyboardEvent): boolean {
@@ -218,6 +279,11 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if (event.key === "F11") {
+      event.preventDefault();
+      void toggleFullscreen();
+      return;
+    }
     if (handleZoomShortcut(event)) return;
     if (!authenticated || isEditableTarget(event.target)) return;
     if (!event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
@@ -238,7 +304,13 @@
     loginError = "";
     try {
       authenticated = await invoke<boolean>("is_authenticated");
-      if (authenticated) void refreshProjects();
+      if (authenticated) {
+        // 재시작/새로고침 후에도 학교 키 사용자의 표시 이름을 복원한다.
+        const profile = loadSessionProfile();
+        if (profile) username = profile.displayName;
+        void refreshProjects();
+        void refreshModels();
+      }
     } catch (error) {
       authenticated = false;
       loginError = `인증 상태를 확인하지 못했습니다: ${describeError(error)}`;
@@ -258,13 +330,38 @@
         password: loginPassword,
       });
       loginPassword = "";
+      clearSessionProfile();
       authenticated = true;
       void refreshProjects();
+      void refreshModels();
     } catch (error) {
       authenticated = false;
       loginError = `로그인 실패: ${describeError(error)}`;
     } finally {
       loginLoading = false;
+    }
+  }
+
+  async function handleSchoolLogin(event: SubmitEvent) {
+    event.preventDefault();
+    if (schoolLoginLoading) return;
+    schoolLoginError = "";
+    schoolLoginLoading = true;
+    try {
+      username = await invoke<string>("login_school_key", {
+        schoolApiKey,
+      });
+      schoolApiKey = "";
+      username = SCHOOL_DISPLAY_NAME;
+      saveSessionProfile({ displayName: SCHOOL_DISPLAY_NAME, is_byok: true });
+      authenticated = true;
+      void refreshProjects();
+      void refreshModels();
+    } catch (error) {
+      authenticated = false;
+      schoolLoginError = `학교 AI 로그인 실패: ${describeError(error)}`;
+    } finally {
+      schoolLoginLoading = false;
     }
   }
 
@@ -275,11 +372,20 @@
       await invoke("logout");
       authenticated = false;
       username = "";
+      clearSessionProfile();
       loginPassword = "";
       resetAnalysis();
     } catch (error) {
       errorMessage = `로그아웃하지 못했습니다: ${describeError(error)}`;
     }
+  }
+
+  /** 로그인 후 사용 가능한 모델 목록을 불러오고 선택값을 보정한다. */
+  async function refreshModels() {
+    const list = await loadModels();
+    selectedModel = pickDefaultModel(list, selectedModel);
+    const failure = get(modelsError);
+    if (failure !== null && isServerUnavailable(failure)) serverDownNotice = SERVER_DOWN_MESSAGE;
   }
 
   async function refreshProjects() {
@@ -345,10 +451,13 @@
     errorMessage = "";
     authExpired = false;
     pendingTempPaths = [];
+    documentMode = false;
+    audioUploadProgress.set(null);
   }
 
   function describeError(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    return isServerUnavailable(message) ? SERVER_DOWN_MESSAGE : message;
   }
 
   async function addFiles(kind: "video" | "pdf") {
@@ -440,7 +549,7 @@
       throw new Error("저장할 분석 결과가 없습니다.");
     }
     phase = "SAVING";
-    const savedProject: StudyProject = {
+    const inMemoryProject: StudyProject = {
       meta: parseProjectMeta(JSON.parse(metadataJson)),
       markdown,
     };
@@ -450,8 +559,17 @@
       markdownContent: markdown,
     });
     signal.throwIfAborted();
+    // 디스크에 원자적으로 저장된 최신 메타(video_paths 등)를 다시 읽어 뷰어 상태를 동기화한다.
+    // 재로드가 실패하면 방금 저장한 메모리 내용으로 대체한다.
+    let savedProject = inMemoryProject;
+    try {
+      const reloaded = await loadStudyProject(projectId);
+      if (reloaded.meta.project_id === projectId) savedProject = reloaded;
+    } catch {
+      // 저장은 이미 성공했으므로 메모리 상태로 계속 진행한다.
+    }
+    signal.throwIfAborted();
     projectDirectory = directory;
-    await cleanupTempFiles();
     phase = "COMPLETED";
     // Invalidate any older library load, then open the exact content just saved.
     openVersion += 1;
@@ -470,38 +588,63 @@
   }
 
   async function startAnalysis() {
-    if (controlsDisabled || videos.length === 0 || pdfs.length === 0) return;
+    if (controlsDisabled || (videos.length === 0 && pdfs.length === 0)) return;
     resetAnalysis();
     const controller = new AbortController();
     activeController = controller;
     const { signal } = controller;
+    const hasVideos = videos.length > 0;
+    documentMode = !hasVideos;
     const sourceVideos = videos.map((item) => item.path);
-    const sourceTitle = lectureTitle.trim() || videoFilename(sourceVideos[0]);
+    const sourceTitle =
+      lectureTitle.trim() ||
+      (hasVideos ? videoFilename(sourceVideos[0]) : pdfs[0]?.name ?? "제목 없는 강의");
     const sourceCourse = lectureCourse.trim();
     const sourceChapter = lectureChapter.trim();
+    const sourceModel = pickDefaultModel($models, selectedModel);
+    const sourceMode = analysisMode;
     const startedAt = new Date().toISOString();
 
     try {
-      phase = "EXTRACTING_AUDIO";
+      // 문서 전용이면 오디오 추출 단계를 건너뛰고 곧바로 업로드/요약으로 간다.
+      phase = hasVideos ? "EXTRACTING_AUDIO" : "UPLOADING";
       // 여러 PDF는 pdf-lib으로 먼저 하나로 병합하고, 여러 영상은 오디오만 추출해 이어 붙인다.
       const pdfSource = await prepareMergedPdf();
       signal.throwIfAborted();
-      const outputAudioPath = await mergedAudioOutputPath();
-      signal.throwIfAborted();
-      const extracted = await invoke<{ audioPath: string; videoDurations: number[] }>(
-        "extract_and_merge_audio_from_videos",
-        { videoPaths: sourceVideos, outputAudioPath },
-      );
-      // Rust invocations cannot be aborted from JS, but no next step runs after teardown.
-      signal.throwIfAborted();
+
+      let extracted: { audioPath: string; videoDurations: number[] } | null = null;
+      if (hasVideos) {
+        const outputAudioPath = await mergedAudioOutputPath();
+        signal.throwIfAborted();
+        extracted = await invoke<{ audioPath: string; videoDurations: number[] }>(
+          "extract_and_merge_audio_from_videos",
+          { videoPaths: sourceVideos, outputAudioPath },
+        );
+        // Rust invocations cannot be aborted from JS, but no next step runs after teardown.
+        signal.throwIfAborted();
+      }
+
       // 저장이 끝나면 삭제할 임시 산출물(추출 오디오 + 병합 PDF)을 기록해 둔다.
-      pendingTempPaths = [extracted.audioPath];
+      pendingTempPaths = extracted ? [extracted.audioPath] : [];
       if (pdfSource.temporary) pendingTempPaths.push(pdfSource.path);
 
       phase = "UPLOADING";
       const response = await invoke<string>("upload_job", {
-        audioPath: extracted.audioPath,
+        audioPath: extracted?.audioPath ?? null,
         pdfPath: pdfSource.path,
+        model: sourceModel,
+        analysisMode: sourceMode,
+        metadataJson: JSON.stringify({
+          document_only: !hasVideos,
+          title: sourceTitle,
+          course: sourceCourse || undefined,
+          chapter: sourceChapter || undefined,
+          model: sourceModel,
+          analysis_mode: sourceMode,
+          video_paths: hasVideos ? sourceVideos : [],
+          video_durations: extracted?.videoDurations ?? [],
+          pdf_paths: pdfs.map((item) => item.path),
+        }),
       });
       signal.throwIfAborted();
       const uploaded = parseUploadResponse(response);
@@ -519,11 +662,14 @@
         title: sourceTitle,
         course: sourceCourse || undefined,
         chapter: sourceChapter || undefined,
+        model: sourceModel,
+        analysis_mode: sourceMode,
         job_id: result.job_id,
         status: result.status,
-        video_path: sourceVideos[0],
-        video_paths: sourceVideos,
-        video_durations: extracted.videoDurations,
+        document_only: !hasVideos,
+        video_path: hasVideos ? sourceVideos[0] : null,
+        video_paths: hasVideos ? sourceVideos : [],
+        video_durations: extracted?.videoDurations ?? [],
         pdf_path: pdfSource.path,
         pdf_paths: pdfs.map((item) => item.path),
         timestamps: result.timestamps ?? undefined,
@@ -535,6 +681,8 @@
       handleFailure(error, controller);
     } finally {
       if (activeController === controller) activeController = null;
+      // 성공/실패/취소와 무관하게 임시 오디오/병합 PDF를 정리한다.
+      await cleanupTempFiles();
     }
   }
 
@@ -573,32 +721,83 @@
   {:else if !authenticated}
     <section class="card auth-card" aria-labelledby="login-heading">
       <h2 id="login-heading">로그인</h2>
-      <p class="hint">분석 서비스를 이용하려면 계정으로 로그인해 주세요.</p>
-      <form class="login-form" onsubmit={handleLogin}>
-        <label for="username">아이디</label>
-        <input
-          id="username"
-          name="username"
-          autocomplete="username"
-          bind:value={loginUsername}
-          disabled={loginLoading}
-          required
-        />
-        <label for="password">비밀번호</label>
-        <input
-          id="password"
-          name="password"
-          type="password"
-          autocomplete="current-password"
-          bind:value={loginPassword}
-          disabled={loginLoading}
-          required
-        />
-        {#if loginError}<p class="error" role="alert">{loginError}</p>{/if}
-        <button class="primary" type="submit" disabled={loginLoading}>
-          {loginLoading ? "로그인 중..." : "로그인"}
-        </button>
-      </form>
+      <div class="login-tabs" role="tablist" aria-label="로그인 방식">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={loginMode === "school"}
+          onclick={() => { loginMode = "school"; }}
+        >학교 AI 키 로그인</button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={loginMode === "account"}
+          onclick={() => { loginMode = "account"; }}
+        >기존 계정 로그인</button>
+      </div>
+
+      {#if loginMode === "school"}
+        <div class="key-steps">
+          <h3>고려대 세종 학생 전용 무료 AI 로그인</h3>
+          <ol>
+            <li><strong>1단계</strong>: <code>kusllm.korea.ac.kr</code> (고려대 세종 BAZE 포털)에 통합 계정으로 로그인합니다.</li>
+            <li><strong>2단계</strong>: 좌측 하단 메뉴에서 <strong>[API Gateway]</strong>를 클릭하고 <strong>[API 키 생성]</strong> 버튼을 누릅니다.</li>
+            <li><strong>3단계</strong>: 발급된 <code>sk-factchat-...</code> 형식의 키를 아래에 복사해 넣으세요.</li>
+          </ol>
+          <p class="key-credit">학교에서 매월 <strong>3,000 크레딧</strong>을 무료로 제공합니다. (2시간 강의 요약 시 약 30크레딧 소모 = 한 달에 100개 이상 요약 가능!)</p>
+        </div>
+        <form class="login-form" onsubmit={handleSchoolLogin}>
+          <label for="school-api-key">학교 AI API Key</label>
+          <div class="password-row">
+            <input
+              id="school-api-key"
+              name="school-api-key"
+              type={showSchoolKey ? "text" : "password"}
+              autocomplete="off"
+              bind:value={schoolApiKey}
+              disabled={schoolLoginLoading}
+              required
+            />
+            <button
+              type="button"
+              onclick={() => { showSchoolKey = !showSchoolKey; }}
+              disabled={schoolLoginLoading}
+            >{showSchoolKey ? "숨기기" : "표시"}</button>
+          </div>
+          <p class="key-warning">API 키는 생성 시 단 1회만 표시되므로 안전한 곳에 복사해 두세요.</p>
+          {#if schoolLoginError}<p class="error" role="alert">{schoolLoginError}</p>{/if}
+          <button class="primary" type="submit" disabled={schoolLoginLoading}>
+            {schoolLoginLoading ? "확인 중..." : "학교 AI 키로 로그인"}
+          </button>
+        </form>
+      {:else}
+        <p class="hint">관리자/지인용 계정으로 로그인합니다.</p>
+        <form class="login-form" onsubmit={handleLogin}>
+          <label for="username">아이디</label>
+          <input
+            id="username"
+            name="username"
+            autocomplete="username"
+            bind:value={loginUsername}
+            disabled={loginLoading}
+            required
+          />
+          <label for="password">비밀번호</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            bind:value={loginPassword}
+            disabled={loginLoading}
+            required
+          />
+          {#if loginError}<p class="error" role="alert">{loginError}</p>{/if}
+          <button class="primary" type="submit" disabled={loginLoading}>
+            {loginLoading ? "로그인 중..." : "로그인"}
+          </button>
+        </form>
+      {/if}
     </section>
   {:else}
     <div class="workspace">
@@ -618,7 +817,8 @@
           </button>
         </nav>
         <div class="sidebar-footer">
-          <span class="user-name"><strong>{username || "사용자"}</strong> 님</span>
+          <span class="user-name"><strong>{username || "사용자"}</strong>{username.endsWith("님") ? "" : " 님"}</span>
+          <button type="button" onclick={() => { noticeModalOpen = true; }}>공지 / 후원 / 문의</button>
           <button type="button" onclick={handleLogout}>로그아웃</button>
         </div>
       </aside>
@@ -713,6 +913,32 @@
                     disabled={controlsDisabled}
                   />
                 </div>
+                <div class="title-field">
+                  <label for="analysis-model">분석 모델 선택</label>
+                  <select
+                    id="analysis-model"
+                    bind:value={selectedModel}
+                    disabled={controlsDisabled}
+                  >
+                    {#each $models as model (model.id)}
+                      <option value={model.id}>{model.name}</option>
+                    {/each}
+                  </select>
+                </div>
+                <div class="title-field mode-field">
+                  <span id="analysis-mode-label">학습 산출물 모드</span>
+                  <div class="mode-group" role="radiogroup" aria-labelledby="analysis-mode-label">
+                    {#each ANALYSIS_MODE_OPTIONS as option (option.value)}
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={analysisMode === option.value}
+                        disabled={controlsDisabled}
+                        onclick={() => { analysisMode = option.value; }}
+                      >{option.label}</button>
+                    {/each}
+                  </div>
+                </div>
               </div>
               <MediaFileList
                 items={videos}
@@ -732,6 +958,8 @@
                 hint="여러 PDF를 선택하면 pdf-lib으로 무손실 병합됩니다."
                 addLabel={selecting ? "추가 중..." : "PDF 파일 추가"}
                 emptyText="분석할 교안 PDF를 추가해 주세요."
+                badgeLabel="PDF 전용"
+                badgeTooltip="교안 파일은 PDF 형식만 지원합니다. PPT 자료는 PDF로 내보낸 뒤 추가해 주세요."
                 disabled={controlsDisabled}
                 onadd={() => addFiles("pdf")}
                 onremove={removePdf}
@@ -743,7 +971,7 @@
                 type="button"
                 class="primary"
                 onclick={startAnalysis}
-                disabled={controlsDisabled || videos.length === 0 || pdfs.length === 0}
+                disabled={controlsDisabled || (videos.length === 0 && pdfs.length === 0)}
               >
                 {busy ? "분석 진행 중..." : phase === "IDLE" ? "분석 시작" : "새로 분석 시작"}
               </button>
@@ -802,6 +1030,24 @@
   <div class="zoom-toast" role="status" aria-live="polite">{zoomPercent}%</div>
 {/if}
 
+{#if noticeModalOpen}
+  <NoticeAndSupportModal onclose={() => { noticeModalOpen = false; }} />
+{/if}
+
+{#if serverDownNotice}
+  <div class="ppt-toast" role="alert">
+    <span>{serverDownNotice}</span>
+    <button type="button" aria-label="알림 닫기" onclick={() => { serverDownNotice = ""; }}>×</button>
+  </div>
+{/if}
+
+{#if pptWarning}
+  <div class="ppt-toast" role="alert">
+    <span>{pptWarning}</span>
+    <button type="button" aria-label="경고 닫기" onclick={() => { pptWarning = ""; }}>×</button>
+  </div>
+{/if}
+
 <style>
   :global(body) {
     margin: 0;
@@ -825,6 +1071,69 @@
     font-weight: 700;
     box-shadow: 0 8px 24px rgba(23, 33, 58, 0.24);
     z-index: 1000;
+  }
+  .ppt-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: min(680px, calc(100vw - 32px));
+    padding: 12px 16px;
+    border-radius: 12px;
+    border: 1px solid #f0c98a;
+    background: #fff4e5;
+    color: #8a4b00;
+    font-size: 0.88rem;
+    box-shadow: 0 10px 30px rgba(23, 33, 58, 0.18);
+    z-index: 1100;
+  }
+  .ppt-toast button {
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .login-tabs {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  .login-tabs button {
+    flex: 1 1 auto;
+    padding: 9px 12px;
+    border: 1px solid #cbd2e5;
+    border-radius: 9px;
+    background: white;
+    color: #26396d;
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .login-tabs button[aria-selected="true"],
+  .login-tabs button[aria-selected="true"]:hover:not(:disabled) {
+    background: #4255bf;
+    border-color: #4255bf;
+    color: white;
+  }
+  .password-row { display: flex; gap: 8px; }
+  .password-row input { flex: 1 1 auto; }
+  .password-row button {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    border: 1px solid #cbd2e5;
+    border-radius: 8px;
+    background: white;
+    color: #26396d;
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
   }
   header { margin-bottom: 26px; }
   .auth-card { max-width: 440px; margin: 48px auto 0; }
@@ -919,6 +1228,12 @@
   .title-field label { font-size: 0.9rem; font-weight: 600; }
   .title-field input { width: 100%; border: 1px solid #cbd2e5; border-radius: 8px; padding: 12px; font: inherit; }
   .title-field input:focus-visible { outline: 3px solid #8597f1; outline-offset: 2px; }
+  .mode-field { grid-column: 1 / -1; }
+  .mode-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .mode-group button { padding: 7px 14px; }
+  .mode-group button[aria-checked="true"],
+  .mode-group button[aria-checked="true"]:hover:not(:disabled) { background: #4255bf; border-color: #4255bf; color: #ffffff; }
+  #analysis-model { padding: 9px 10px; border: 1px solid #cbd2e5; border-radius: 8px; font: inherit; }
   .course-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
   .course-tabs button { padding: 7px 14px; }
   .course-tabs button:hover:not(:disabled):not([aria-pressed="true"]) { background: #eef1ff; border-color: #4758c4; }
@@ -939,7 +1254,13 @@
   button:focus-visible { outline: 3px solid #8597f1; outline-offset: 3px; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .primary { width: 100%; margin-top: 16px; background: #4255bf; border-color: #4255bf; color: white; }
-  .primary:hover:not(:disabled) { background: #3345a8; }
+  /* 전역 button:hover(밝은 배경)보다 우선하도록 명시도를 높이고 글자색을 유지한다. */
+  .primary:hover:not(:disabled):not([aria-pressed="true"]) { background: #3345a8; border-color: #3345a8; color: #ffffff; }
+  .key-steps h3 { margin: 16px 0 8px; font-size: 1rem; }
+  .key-steps ol { margin: 0; padding-left: 20px; font-size: 0.88rem; line-height: 1.7; color: #3b475e; }
+  .key-steps code { padding: 1px 5px; border-radius: 4px; background: #eef1ff; color: #344694; }
+  .key-credit { margin: 10px 0 4px; padding: 10px 12px; border: 1px solid #b9c5f5; border-radius: 8px; background: #eef1ff; color: #26396d; font-size: 0.85rem; }
+  .key-warning { margin: 6px 0 0; padding: 8px 10px; border: 1px solid #f0c98a; border-radius: 8px; background: #fff4e5; color: #8a4b00; font-size: 0.82rem; }
   .section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
   .badge { background: #eef1ff; color: #344694; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; }
   progress { width: 100%; height: 6px; accent-color: #4255bf; }

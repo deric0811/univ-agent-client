@@ -47,15 +47,17 @@ export function renderSummary(markdown: string): DocumentFragment {
   }
   for (const text of texts) {
     const value = text.data;
-    const pattern = /\[\d{2,}:[0-5]\d(?::[0-5]\d)?\]/g;
+    // `[00:15:30]`와 백엔드가 만드는 `[파일명.json - 00:15:30]` 형식을 모두 지원한다.
+    const pattern = /\[(?:[^\][\n]*?\s-\s)?(\d{2,}:[0-5]\d(?::[0-5]\d)?)\]/g;
     const replacement = document.createDocumentFragment();
     let offset = 0;
     for (const match of value.matchAll(pattern)) {
-      const seconds = timestampSeconds(match[0]);
+      const seconds = timestampSeconds(`[${match[1]}]`);
       if (seconds === null) continue;
       replacement.append(document.createTextNode(value.slice(offset, match.index)));
       const button = document.createElement("button");
       button.type = "button";
+      button.className = "timestamp-link";
       button.dataset.seconds = String(seconds);
       button.textContent = match[0];
       button.setAttribute("aria-label", `${match[0]} 시점으로 이동하여 재생`);

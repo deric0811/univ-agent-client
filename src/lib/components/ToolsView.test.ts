@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushSync, mount, unmount } from "svelte";
+import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import ToolsView from "./ToolsView.svelte";
@@ -147,6 +148,29 @@ describe("ToolsView store integration", () => {
 
     resolveMerge("/videos/out.mp4");
     await vi.waitFor(() => expect(target.textContent).toContain("영상 합치기 완료: /videos/out.mp4"));
+  });
+
+  it("reorders the video list through HTML5 drag and drop", async () => {
+    videoMergeStore.addFiles([
+      { path: "/videos/a.mp4", name: "a.mp4" },
+      { path: "/videos/b.mp4", name: "b.mp4" },
+    ]);
+    component = mount(ToolsView, { target });
+    flushSync();
+
+    const items = target.querySelectorAll<HTMLLIElement>(".video-list li");
+    expect(items).toHaveLength(2);
+
+    items[0].dispatchEvent(new Event("dragstart", { bubbles: true }));
+    items[1].dispatchEvent(new Event("dragover", { bubbles: true, cancelable: true }));
+    flushSync();
+    expect(items[1].classList.contains("drag-over")).toBe(true);
+
+    items[1].dispatchEvent(new Event("drop", { bubbles: true, cancelable: true }));
+
+    await vi.waitFor(() =>
+      expect(get(videoMergeStore).fileList.map((file) => file.name)).toEqual(["b.mp4", "a.mp4"]),
+    );
   });
 
   it("clears the list and status only through the explicit reset action", async () => {

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { listStudyProjects, loadStudyProject, uniqueCourseNames, videoFilename, formatCreatedAt } from "./study-projects";
+import { listStudyProjects, loadStudyProject, parseProjectMeta, uniqueCourseNames, videoFilename, formatCreatedAt } from "./study-projects";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const invokeMock = vi.mocked(invoke);
@@ -57,6 +57,22 @@ it("uses Unix and Windows video filenames as fallback titles", () => {
 
 it("handles missing legacy creation dates", () => {
   expect(formatCreatedAt("")).toBe("생성일 정보 없음");
+});
+
+it("accepts document-only metadata without a video path", () => {
+  const parsed = parseProjectMeta({
+    project_id: "doc-only",
+    title: "문서 전용 강의",
+    created_at: "2026-09-18T00:00:00Z",
+    video_path: null,
+    video_paths: [],
+    video_durations: [],
+    pdf_path: "/notes/slides.pdf",
+    pdf_paths: ["/notes/slides.pdf"],
+  });
+  expect(parsed.video_path).toBe("");
+  expect(parsed.video_paths).toEqual([]);
+  expect(parsed.pdf_path).toBe("/notes/slides.pdf");
 });
 
 it("collects unique trimmed course names for autocomplete", () => {

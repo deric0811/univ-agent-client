@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appendMediaFiles, fileName, moveWithin, type MediaFile } from "./media-files";
+import { appendMediaFiles, fileName, isPptPath, moveWithin, type MediaFile } from "./media-files";
 
 describe("media file helpers", () => {
   it("extracts the base name from Unix and Windows paths", () => {
@@ -23,6 +23,13 @@ describe("media file helpers", () => {
     ]);
     // 원본 배열은 변하지 않는다.
     expect(first).toHaveLength(1);
+  });
+
+  it("detects PowerPoint files regardless of case", () => {
+    expect(isPptPath("/notes/lecture.pptx")).toBe(true);
+    expect(isPptPath("C:\\자료\\강의.PPT")).toBe(true);
+    expect(isPptPath("/notes/lecture.pdf")).toBe(false);
+    expect(isPptPath("/notes/lecture.mp4")).toBe(false);
   });
 
   it("reorders items and ignores out-of-range moves", () => {

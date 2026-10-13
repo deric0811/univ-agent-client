@@ -3,6 +3,14 @@ export interface MediaFile {
   name: string;
 }
 
+/** PowerPoint 원본은 직접 등록할 수 없다(PDF로 변환 후 업로드). */
+export const PPT_EXTENSIONS = [".ppt", ".pptx"] as const;
+
+export function isPptPath(path: string): boolean {
+  const lower = path.trim().toLowerCase();
+  return PPT_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
 export function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
 }

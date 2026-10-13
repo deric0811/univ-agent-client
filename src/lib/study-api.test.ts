@@ -42,15 +42,38 @@ describe("upload response", () => {
     }))).toEqual({ job_id: jobId, status: "queued", waiting_count: 2 });
   });
 
+  it("accepts the minimal backend response and keeps polling", async () => {
+    const parsed = parseUploadResponse(json({ job_id: jobId, status: "queued" }));
+    expect(parsed).toEqual({ job_id: jobId, status: "queued", waiting_count: 0 });
+
+    invokeMock
+      .mockResolvedValueOnce(json(status("completed")))
+      .mockResolvedValueOnce(json(result));
+    const onStatus = vi.fn();
+    const pending = pollJobResult(parsed.job_id, onStatus, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(pending).resolves.toEqual(result);
+    expect(invokeMock).toHaveBeenCalledWith("get_job_status", { jobId: parsed.job_id });
+  });
+
+  it("accepts camelCase aliases and object payloads", () => {
+    expect(parseUploadResponse({ jobId: "uuid-camel", queuePosition: 3 })).toEqual({
+      job_id: "uuid-camel", status: "queued", waiting_count: 3,
+    });
+    expect(parseUploadResponse({ job_id: "snake", queue_position: 1 })).toEqual({
+      job_id: "snake", status: "queued", waiting_count: 1,
+    });
+  });
+
   it.each([
     "not json",
     "null",
     "[]",
     "{}",
-    '{"job_id":"","status":"queued","waiting_count":0}',
-    '{"job_id":"id","status":"completed","waiting_count":0}',
-    '{"job_id":"id","status":"queued","waiting_count":-1}',
-  ])("rejects invalid upload data: %s", (response) => {
+    '{"job_id":""}',
+    '{"jobId":"   "}',
+    '{"job_id":123}',
+  ])("rejects upload data without a usable job id: %s", (response) => {
     expect(() => parseUploadResponse(response)).toThrow();
   });
 });
@@ -87,6 +110,19 @@ describe("job polling through Rust IPC", () => {
       ["get_job_result", { jobId }],
     ]);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("normalizes legacy uppercase statuses during polling", async () => {
+    invokeMock
+      .mockResolvedValueOnce(json({ ...status("queued"), status: "RUNNING_STT" }))
+      .mockResolvedValueOnce(json({ ...status("queued"), status: "COMPLETED" }))
+      .mockResolvedValueOnce(json({ ...result, status: "COMPLETED" }));
+    const onStatus = vi.fn();
+    const pending = pollJobResult(jobId, onStatus, new AbortController().signal);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onStatus).toHaveBeenLastCalledWith(status("transcribing"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(pending).resolves.toEqual(result);
   });
 
   it("stops immediately on failed and exposes the server error", async () => {

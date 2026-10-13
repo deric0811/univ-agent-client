@@ -28,7 +28,7 @@ tauri-plugin-process = "2"
 tauri-plugin-shell = "2"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["multipart", "json", "stream"] }
-tokio = { version = "1", features = ["fs"] }
+tokio = { version = "1", features = ["fs", "io-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 

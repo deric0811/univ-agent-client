@@ -9,6 +9,23 @@ const JOB_STATUSES = ["queued", "transcribing", "summarizing", "completed", "fai
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
+// 백엔드가 대문자/레거시 상태명을 돌려줘도 같은 흐름으로 매핑한다.
+const JOB_STATUS_ALIASES: Record<string, JobStatus> = {
+  queued: "queued",
+  pending: "queued",
+  transcribing: "transcribing",
+  running_stt: "transcribing",
+  summarizing: "summarizing",
+  postprocessing: "summarizing",
+  completed: "completed",
+  failed: "failed",
+};
+
+function normalizeJobStatus(value: unknown): JobStatus | null {
+  if (typeof value !== "string") return null;
+  return JOB_STATUS_ALIASES[value.trim().toLowerCase()] ?? null;
+}
+
 export interface UploadJobResponse {
   job_id: string;
   status: "queued";
@@ -53,8 +70,30 @@ function objectResponse(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function hasJobId(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+function parseJsonText(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("업로드 응답이 올바른 JSON이 아닙니다.");
+  }
+}
+
+/** snake_case / camelCase 어느 쪽으로 와도 비어있지 않은 문자열을 찾아낸다. */
+function readStringField(data: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return null;
+}
+
+/** 대기열 정보 필드명이 달라도 음이 아닌 정수를 찾아낸다. */
+function readCountField(data: Record<string, unknown>, ...keys: string[]): number | null {
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+  }
+  return null;
 }
 
 function hasWaitingCount(value: unknown): value is number {
@@ -70,30 +109,36 @@ function isAuthFailure(error: unknown): boolean {
   return /HTTP\s*40[13]\b/.test(message) || message.includes("로그인이 필요합니다");
 }
 
-export function parseUploadResponse(json: string): UploadJobResponse {
-  let value: unknown;
-  try {
-    value = JSON.parse(json);
-  } catch {
-    throw new Error("업로드 응답이 올바른 JSON이 아닙니다.");
-  }
-  const data = objectResponse(value);
-  if (!hasJobId(data.job_id) || data.status !== "queued" || !hasWaitingCount(data.waiting_count)) {
+/**
+ * 업로드 응답을 관대하게 해석한다. JSON 문자열/객체 모두 허용하고,
+ * job_id/jobId 와 waiting_count/queue_position/queuePosition 을 모두 지원한다.
+ * 유효한 jobId만 있으면 즉시 작업으로 승인한다.
+ */
+export function parseUploadResponse(data: unknown): UploadJobResponse {
+  const value = typeof data === "string" ? parseJsonText(data) : data;
+  const record = objectResponse(value);
+  const jobId = readStringField(record, "jobId", "job_id");
+  if (jobId === null) {
     throw new Error("업로드 응답에 유효한 작업 ID 또는 대기열 정보가 없습니다.");
   }
-  return {
-    job_id: data.job_id,
-    status: data.status,
-    waiting_count: data.waiting_count,
-  };
+  const waitingCount =
+    readCountField(
+      record,
+      "waiting_count",
+      "waitingCount",
+      "queue_position",
+      "queuePosition",
+    ) ?? 0;
+  return { job_id: jobId, status: "queued", waiting_count: waitingCount };
 }
 
 function parseJobStatus(value: unknown, jobId: string): JobStatusResponse {
   const data = objectResponse(value);
+  const responseJobId = readStringField(data, "jobId", "job_id");
+  const status = normalizeJobStatus(data.status);
   if (
-    data.job_id !== jobId ||
-    typeof data.status !== "string" ||
-    !JOB_STATUSES.includes(data.status as JobStatus) ||
+    responseJobId !== jobId ||
+    status === null ||
     !hasWaitingCount(data.waiting_count) ||
     !(data.error_message === null || typeof data.error_message === "string")
   ) {
@@ -101,7 +146,7 @@ function parseJobStatus(value: unknown, jobId: string): JobStatusResponse {
   }
   return {
     job_id: jobId,
-    status: data.status as JobStatus,
+    status,
     waiting_count: data.waiting_count,
     error_message: data.error_message,
   };
@@ -109,9 +154,10 @@ function parseJobStatus(value: unknown, jobId: string): JobStatusResponse {
 
 function parseJobResult(value: unknown, jobId: string): JobResultResponse {
   const data = objectResponse(value);
+  const responseJobId = readStringField(data, "jobId", "job_id");
   if (
-    data.job_id !== jobId ||
-    data.status !== "completed" ||
+    responseJobId !== jobId ||
+    normalizeJobStatus(data.status) !== "completed" ||
     typeof data.content !== "string"
   ) {
     throw new Error("완료된 작업의 마크다운 응답이 올바르지 않습니다.");

@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::SeekFrom,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -13,11 +14,25 @@ use tauri_plugin_shell::{
     process::{Command, CommandChild, CommandEvent},
     ShellExt,
 };
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const JOBS_URL: &str = "https://univ-agent.h2omol.com/api/v1/jobs";
+const UPLOAD_CHUNK_URL: &str = "https://univ-agent.h2omol.com/api/v1/upload/chunk";
 const LOGIN_URL: &str = "https://univ-agent.h2omol.com/api/v1/auth/login";
+const MODELS_URL: &str = "https://univ-agent.h2omol.com/api/v1/models";
+const SERVER_DOWN_MESSAGE: &str = "서버가 점검 중이거나 꺼져 있습니다. 개발자에게 문의하세요.";
+const SCHOOL_DISPLAY_NAME: &str = "고려대 학우님";
+const SCHOOL_LOGIN_URL: &str = "https://univ-agent.h2omol.com/api/v1/auth/login-school-key";
+
+/// Cloudflare 100MB 요청 제한을 안전하게 통과하는 청크 크기(20MB).
+const AUDIO_CHUNK_SIZE_BYTES: u64 = 20 * 1024 * 1024;
+/// 청크별 최대 시도 횟수(최초 1회 + 재시도 2회).
+const AUDIO_CHUNK_MAX_ATTEMPTS: usize = 3;
+const UPLOAD_CONNECT_TIMEOUT_SECS: u64 = 30;
+const UPLOAD_TIMEOUT_SECS: u64 = 30 * 60;
+const AUDIO_UPLOAD_PROGRESS_EVENT: &str = "audio-upload-progress";
 
 pub struct AuthState(pub std::sync::Mutex<Option<String>>);
 
@@ -164,6 +179,26 @@ struct LoginRequest<'a> {
 #[derive(Deserialize)]
 struct LoginResponse {
     access_token: String,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SchoolKeyLoginRequest<'a> {
+    school_api_key: &'a str,
+}
+
+/// 서버가 꺼져 있을 때 무한 대기하지 않도록 타임아웃이 있는 로그인용 클라이언트.
+fn login_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("Failed to initialize the login client: {error}"))
+}
+
+fn is_server_down(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
 }
 
 #[tauri::command]
@@ -177,7 +212,7 @@ pub async fn login(
         return Err("아이디와 비밀번호를 모두 입력해 주세요.".to_string());
     }
 
-    let response = reqwest::Client::new()
+    let response = login_client()?
         .post(LOGIN_URL)
         .json(&LoginRequest {
             username: &username,
@@ -185,7 +220,7 @@ pub async fn login(
         })
         .send()
         .await
-        .map_err(|error| format!("로그인 서버에 연결하지 못했습니다: {error}"))?;
+        .map_err(|_| SERVER_DOWN_MESSAGE.to_string())?;
     let status = response.status();
     let body = response
         .text()
@@ -193,7 +228,9 @@ pub async fn login(
         .map_err(|error| format!("로그인 응답을 읽지 못했습니다: {error}"))?;
 
     if !status.is_success() {
-        return if status == reqwest::StatusCode::UNAUTHORIZED {
+        return if is_server_down(status) {
+            Err(SERVER_DOWN_MESSAGE.to_string())
+        } else if status == reqwest::StatusCode::UNAUTHORIZED {
             Err("아이디 또는 비밀번호가 올바르지 않습니다.".to_string())
         } else {
             Err(format!("로그인에 실패했습니다 (HTTP {status}): {body}"))
@@ -210,6 +247,58 @@ pub async fn login(
         .lock()
         .map_err(|_| "인증 상태를 확인하지 못했습니다.".to_string())? = Some(login.access_token);
     Ok(username)
+}
+
+#[tauri::command]
+pub async fn login_school_key(
+    state: State<'_, AuthState>,
+    school_api_key: String,
+) -> Result<String, String> {
+    let school_api_key = school_api_key.trim().to_owned();
+    if school_api_key.is_empty() {
+        return Err("학교 AI API 키를 입력해 주세요.".to_string());
+    }
+
+    let response = login_client()?
+        .post(SCHOOL_LOGIN_URL)
+        .json(&SchoolKeyLoginRequest {
+            school_api_key: &school_api_key,
+        })
+        .send()
+        .await
+        .map_err(|_| SERVER_DOWN_MESSAGE.to_string())?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("학교 AI 로그인 응답을 읽지 못했습니다: {error}"))?;
+
+    if !status.is_success() {
+        return if is_server_down(status) {
+            Err(SERVER_DOWN_MESSAGE.to_string())
+        } else if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            Err("유효하지 않은 학교 AI API 키입니다.".to_string())
+        } else {
+            Err(format!(
+                "학교 AI 로그인에 실패했습니다 (HTTP {status}): {body}"
+            ))
+        };
+    }
+
+    let login: LoginResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("로그인 응답 형식이 올바르지 않습니다: {error}"))?;
+    if login.access_token.trim().is_empty() {
+        return Err("로그인 응답에 액세스 토큰이 없습니다.".to_string());
+    }
+    *state
+        .0
+        .lock()
+        .map_err(|_| "인증 상태를 확인하지 못했습니다.".to_string())? = Some(login.access_token);
+    // 학교 API 키(BYOK) 세션은 서버가 준 식별자와 무관하게 표시 이름을 고정한다.
+    let _ = login.username;
+    Ok(SCHOOL_DISPLAY_NAME.to_string())
 }
 
 #[tauri::command]
@@ -420,31 +509,218 @@ impl Drop for TempDirGuard {
     }
 }
 
-/// WAV로 추출된 병합 오디오는 올바른 MIME으로 업로드한다.
-fn audio_content_type(audio_path: &str) -> &'static str {
-    if audio_path.to_ascii_lowercase().ends_with(".wav") {
-        "audio/wav"
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioUploadProgress {
+    chunk_index: usize,
+    total_chunks: usize,
+    message: String,
+}
+
+fn emit_audio_upload_progress(app: &AppHandle, chunk_index: usize, total_chunks: usize) {
+    let _ = app.emit(
+        AUDIO_UPLOAD_PROGRESS_EVENT,
+        AudioUploadProgress {
+            chunk_index,
+            total_chunks,
+            message: format!(
+                "오디오 전송 중... ({}/{} 조각)",
+                chunk_index + 1,
+                total_chunks
+            ),
+        },
+    );
+}
+
+/// 20MB 기준 총 조각 수를 계산한다(빈 파일은 0조각).
+fn audio_chunk_count(file_size: u64) -> usize {
+    if file_size == 0 {
+        0
     } else {
-        "audio/mpeg"
+        file_size.div_ceil(AUDIO_CHUNK_SIZE_BYTES) as usize
     }
+}
+
+/// WAV를 20MB 조각으로 나눠 순차 업로드하고 (upload_id, total_chunks)를 돌려준다.
+/// 각 조각은 네트워크/5xx 오류 시 최대 2회 재시도한다.
+async fn upload_audio_in_chunks(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    token: &str,
+    audio_path: &str,
+) -> Result<(String, usize), String> {
+    let path = Path::new(audio_path);
+    let file_metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("오디오 파일을 확인하지 못했습니다: {error}"))?;
+    if !file_metadata.is_file() {
+        return Err(format!("오디오 경로가 파일이 아닙니다: {audio_path}"));
+    }
+    let file_size = file_metadata.len();
+    if file_size == 0 {
+        return Err("오디오 파일이 비어 있습니다.".to_string());
+    }
+    let total_chunks = audio_chunk_count(file_size);
+    let upload_id = Uuid::new_v4().to_string();
+
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("오디오 파일을 열지 못했습니다: {error}"))?;
+
+    for index in 0..total_chunks {
+        emit_audio_upload_progress(app, index, total_chunks);
+        let offset = index as u64 * AUDIO_CHUNK_SIZE_BYTES;
+        let length = (file_size - offset).min(AUDIO_CHUNK_SIZE_BYTES) as usize;
+        let mut buffer = vec![0u8; length];
+        file.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|error| format!("오디오 조각을 읽지 못했습니다: {error}"))?;
+        file.read_exact(&mut buffer)
+            .await
+            .map_err(|error| format!("오디오 조각을 읽지 못했습니다: {error}"))?;
+        upload_chunk_with_retry(client, token, &upload_id, index, total_chunks, buffer).await?;
+    }
+
+    Ok((upload_id, total_chunks))
+}
+
+async fn upload_chunk_with_retry(
+    client: &reqwest::Client,
+    token: &str,
+    upload_id: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+    buffer: Vec<u8>,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=AUDIO_CHUNK_MAX_ATTEMPTS {
+        let part = Part::bytes(buffer.clone())
+            .file_name(format!("chunk_{chunk_index}.part"))
+            .mime_str("application/octet-stream")
+            .map_err(|error| format!("청크 준비 실패: {error}"))?;
+        let form = Form::new()
+            .text("upload_id", upload_id.to_string())
+            .text("chunk_index", chunk_index.to_string())
+            .text("total_chunks", total_chunks.to_string())
+            .part("chunk_file", part);
+
+        match client
+            .post(UPLOAD_CHUNK_URL)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                let body = response.text().await.unwrap_or_default();
+                last_error =
+                    format!("오디오 조각 {chunk_index} 업로드 실패 (HTTP {status}): {body}");
+                // 4xx는 재시도해도 의미가 없으므로 즉시 중단한다.
+                if !status.is_server_error() {
+                    return Err(last_error);
+                }
+            }
+            Err(error) => {
+                last_error = format!("오디오 조각 {chunk_index} 전송 오류: {error}");
+            }
+        }
+
+        if attempt < AUDIO_CHUNK_MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    Err(last_error)
+}
+
+/// 업로드 응답의 `job_id` / `queue_position`을 snake_case·camelCase 양쪽으로 보강한다.
+/// JSON 파싱에 실패하면 원본 문자열을 그대로 돌려준다.
+fn normalize_job_response(body: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    if let Some(object) = value.as_object_mut() {
+        if let Some(job_id) = object
+            .get("job_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        {
+            object
+                .entry("jobId")
+                .or_insert(serde_json::Value::String(job_id));
+        } else if let Some(job_id) = object
+            .get("jobId")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+        {
+            object
+                .entry("job_id")
+                .or_insert(serde_json::Value::String(job_id));
+        }
+        if let Some(position) = object.get("queue_position").cloned() {
+            object.entry("queuePosition").or_insert(position);
+        } else if let Some(position) = object.get("queuePosition").cloned() {
+            object.entry("queue_position").or_insert(position);
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
 }
 
 #[tauri::command]
 pub async fn upload_job(
+    app: AppHandle,
     state: State<'_, AuthState>,
-    audio_path: String,
+    audio_path: Option<String>,
     pdf_path: String,
+    metadata_json: String,
+    model: Option<String>,
+    analysis_mode: Option<String>,
 ) -> Result<String, String> {
     let token = access_token(&state)?;
-    let audio = upload_file_part(&audio_path, audio_content_type(&audio_path)).await?;
-    let pdf = upload_file_part(&pdf_path, "application/pdf").await?;
-    let form = Form::new().part("audio", audio).part("pdf", pdf);
-
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(30 * 60))
+        .connect_timeout(Duration::from_secs(UPLOAD_CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS))
         .build()
         .map_err(|error| format!("Failed to initialize the upload client: {error}"))?;
+
+    // 1) 오디오가 있는 경우에만 20MB 조각으로 나눠 전송한다.
+    //    문서 전용 분석(PDF만)이면 오디오 업로드를 통째로 건너뛴다.
+    let audio_upload = match audio_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        Some(path) => {
+            let (upload_id, total_chunks) =
+                upload_audio_in_chunks(&app, &client, &token, path).await?;
+            Some((upload_id, total_chunks))
+        }
+        None => None,
+    };
+
+    // 2) PDF/메타데이터와 함께 분석 작업을 트리거한다.
+    let pdf = upload_file_part(&pdf_path, "application/pdf").await?;
+    let mut form = Form::new().text("metadata", metadata_json);
+    if let Some((upload_id, total_chunks)) = audio_upload {
+        form = form
+            .text("upload_id", upload_id)
+            .text("total_chunks", total_chunks.to_string());
+    }
+    if let Some(model) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        form = form.text("model", model.to_string());
+    }
+    if let Some(mode) = analysis_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        form = form.text("analysis_mode", mode.to_string());
+    }
+    let form = form.part("pdf", pdf);
+
     let response = client
         .post(JOBS_URL)
         .bearer_auth(token)
@@ -463,7 +739,16 @@ pub async fn upload_job(
     }
 
     // Preserve the server JSON verbatim; the frontend validates the job response.
-    Ok(body)
+    Ok(normalize_job_response(&body))
+}
+
+/// 현재 계정에서 사용할 수 있는 LLM 모델 목록(JSON)을 가져온다.
+#[tauri::command]
+pub async fn list_models(state: State<'_, AuthState>) -> Result<String, String> {
+    let token = access_token(&state)?;
+    let url =
+        reqwest::Url::parse(MODELS_URL).map_err(|error| format!("Invalid models URL: {error}"))?;
+    get_job_json(url, &token).await
 }
 
 #[tauri::command]
@@ -668,12 +953,8 @@ fn project_directory(app: &AppHandle, project_id: &str) -> Result<std::path::Pat
 }
 
 fn require_project_dir(dir: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(dir).map_err(|error| {
-        format!(
-            "Failed to inspect project '{}': {error}",
-            dir.display()
-        )
-    })?;
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("Failed to inspect project '{}': {error}", dir.display()))?;
     if !metadata.file_type().is_dir() {
         return Err(format!(
             "Project is not a regular directory: '{}'",
@@ -1307,12 +1588,12 @@ pub fn cancel_merge_video(state: State<'_, MergeProcessState>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_content_type, build_concat_list_content, cleanup_temp_files, escape_concat_path,
+        audio_chunk_count, build_concat_list_content, cleanup_temp_files, escape_concat_path,
         fallback_filter_description, is_stream_copy_duration_mismatch, job_query_url,
-        next_merge_action, parse_ffmpeg_duration, parse_progress_seconds, progress_percent,
-        upload_file_part, validate_project_id, write_atomic, Form, MergeAction, MergeProcessState,
-        MergeStage, ProgressThrottle, StageClaimError, StageOutcome, TempDirGuard, TempFileGuard,
-        JOBS_URL,
+        next_merge_action, normalize_job_response, parse_ffmpeg_duration, parse_progress_seconds,
+        progress_percent, upload_file_part, validate_project_id, write_atomic, Form, MergeAction,
+        MergeProcessState, MergeStage, ProgressThrottle, StageClaimError, StageOutcome,
+        TempDirGuard, TempFileGuard, AUDIO_CHUNK_SIZE_BYTES, JOBS_URL,
     };
     use std::{
         fs,
@@ -1465,10 +1746,13 @@ mod tests {
     }
 
     #[test]
-    fn selects_the_audio_content_type_from_the_extension() {
-        assert_eq!(audio_content_type("/cache/merged_audio.wav"), "audio/wav");
-        assert_eq!(audio_content_type("C:\\cache\\MERGED.WAV"), "audio/wav");
-        assert_eq!(audio_content_type("/cache/audio.mp3"), "audio/mpeg");
+    fn computes_audio_chunk_count_for_cloudflare_limit() {
+        assert_eq!(audio_chunk_count(0), 0);
+        assert_eq!(audio_chunk_count(1), 1);
+        assert_eq!(audio_chunk_count(AUDIO_CHUNK_SIZE_BYTES), 1);
+        assert_eq!(audio_chunk_count(AUDIO_CHUNK_SIZE_BYTES + 1), 2);
+        // 130MB WAV는 20MB 단위로 7조각이 된다.
+        assert_eq!(audio_chunk_count(130 * 1024 * 1024), 7);
     }
 
     #[test]
@@ -1488,6 +1772,11 @@ mod tests {
         assert_eq!(
             escape_concat_path(r"C:\videos\it's.mp4", true),
             "file 'C:/videos/it'\\''s.mp4'"
+        );
+        // 드라이브 문자 + 공백 + 한글 + 작은따옴표가 섞인 Windows 경로
+        assert_eq!(
+            escape_concat_path(r"C:\강의 자료\1부 '개요'.mp4", true),
+            "file 'C:/강의 자료/1부 '\\''개요'\\''.mp4'"
         );
     }
 
@@ -1600,6 +1889,25 @@ mod tests {
         assert!(throttle.should_emit(2.6, base + Duration::from_millis(600)));
         // 감소/동일 값은 시간이 지나도 전송하지 않는다.
         assert!(!throttle.should_emit(2.6, base + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn normalizes_upload_response_job_id_aliases() {
+        let normalized =
+            normalize_job_response(r#"{"job_id":"abc","status":"queued","queue_position":2}"#);
+        let value: serde_json::Value = serde_json::from_str(&normalized).unwrap();
+        assert_eq!(value["job_id"], "abc");
+        assert_eq!(value["jobId"], "abc");
+        assert_eq!(value["queue_position"], 2);
+        assert_eq!(value["queuePosition"], 2);
+    }
+
+    #[test]
+    fn leaves_non_json_upload_responses_untouched() {
+        assert_eq!(
+            normalize_job_response("<html>bad gateway</html>"),
+            "<html>bad gateway</html>"
+        );
     }
 
     #[test]
@@ -1754,5 +2062,19 @@ mod tests {
         ] {
             assert!(validate_project_id(project_id).is_err(), "{project_id:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod server_down_tests {
+    use super::*;
+
+    #[test]
+    fn gateway_errors_are_treated_as_server_down() {
+        for code in [502, 503, 504] {
+            assert!(is_server_down(reqwest::StatusCode::from_u16(code).unwrap()));
+        }
+        assert!(!is_server_down(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_server_down(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
     }
 }

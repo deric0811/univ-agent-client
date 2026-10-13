@@ -7,10 +7,18 @@ export interface StudyProjectMeta {
   video_path: string;
   course?: string;
   chapter?: string;
+  /** 분석에 사용한 모델 ID */
+  model?: string;
+  /** 분석 모드: summary | quiz | easy_concept | cheatsheet */
+  analysis_mode?: string;
   /** 다중 영상 프로젝트의 전체 영상 경로(입력 순서) */
   video_paths?: string[];
   /** 다중 영상 프로젝트의 영상별 재생시간(초, 입력 순서) */
   video_durations?: number[];
+  /** 병합/단일 강의자료 PDF 경로 */
+  pdf_path?: string;
+  /** 업로드된 원본 강의자료 PDF 경로 목록 */
+  pdf_paths?: string[];
   [key: string]: unknown;
 }
 
@@ -32,14 +40,20 @@ export function parseProjectMeta(value: unknown): StudyProjectMeta {
     throw new Error("강의 메타데이터가 올바르지 않습니다.");
   }
   const meta = value as Record<string, unknown>;
+  const videoPath = meta.video_path;
   if (
     typeof meta.project_id !== "string" || !meta.project_id.trim() ||
     typeof meta.title !== "string" || !meta.title.trim() ||
-    typeof meta.created_at !== "string" || typeof meta.video_path !== "string"
+    typeof meta.created_at !== "string" ||
+    // 문서 전용 강의는 video_path가 null/누락일 수 있다.
+    !(videoPath === undefined || videoPath === null || typeof videoPath === "string")
   ) {
     throw new Error("강의 메타데이터의 필수 항목이 올바르지 않습니다.");
   }
-  return meta as StudyProjectMeta;
+  return {
+    ...meta,
+    video_path: typeof videoPath === "string" ? videoPath : "",
+  } as StudyProjectMeta;
 }
 
 export async function listStudyProjects(): Promise<StudyProjectMeta[]> {

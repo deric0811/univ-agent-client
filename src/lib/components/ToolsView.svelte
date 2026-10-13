@@ -5,6 +5,7 @@
   import { dirname, downloadDir, join } from "@tauri-apps/api/path";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { cancelVideoMerge } from "$lib/video-tools";
+  import { isPptPath } from "$lib/media-files";
   import {
     videoMergeStore,
     type VideoMergeFile,
@@ -13,6 +14,7 @@
 
   let selecting = $state(false);
   let draggedIndex = $state<number | null>(null);
+  let dragOverIndex = $state<number | null>(null);
   // 파일 선택/저장 대화상자 콜백이 언마운트 뒤에 로컬 상태를 건드리지 않도록 막는다.
   // 병합 작업 상태는 스토어가 소유하므로 컴포넌트 수명과 무관하게 유지된다.
   let disposed = false;
@@ -75,10 +77,20 @@
       if (disposed || selected === null) return;
       const paths = Array.isArray(selected) ? selected : [selected];
       const added: VideoMergeFile[] = [];
+      let rejectedPpt = false;
       for (const path of paths) {
         if (typeof path === "string" && path.trim()) {
+          if (isPptPath(path)) {
+            rejectedPpt = true;
+            continue;
+          }
           added.push({ path, name: videoName(path) });
         }
+      }
+      if (rejectedPpt) {
+        videoMergeStore.failMerge(
+          "PPT/PPTX 파일은 직접 등록할 수 없습니다. PowerPoint에서 [다른 이름으로 저장 > PDF]로 변환 후 업로드해 주세요.",
+        );
       }
       if (added.length === 0) return;
       const isFirstSelection = get(videoMergeStore).fileList.length === 0;
@@ -163,22 +175,25 @@
     }
   }
 
-  function handleDragOver(event: DragEvent) {
+  function handleDragOver(event: DragEvent, index: number) {
     if (running) return;
     event.preventDefault();
     if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    if (draggedIndex !== null && draggedIndex !== index) dragOverIndex = index;
   }
 
   function handleDrop(event: DragEvent, index: number) {
     event.preventDefault();
     const fromIndex = draggedIndex;
     draggedIndex = null;
+    dragOverIndex = null;
     if (running || fromIndex === null || fromIndex === index) return;
     moveVideo(fromIndex, index);
   }
 
   function handleDragEnd() {
     draggedIndex = null;
+    dragOverIndex = null;
   }
 
   async function runConcat() {
@@ -255,8 +270,9 @@
           <li
             draggable={!running}
             class:dragging={draggedIndex === index}
+            class:drag-over={dragOverIndex === index && draggedIndex !== index}
             ondragstart={(event) => handleDragStart(event, index)}
-            ondragover={handleDragOver}
+            ondragover={(event) => handleDragOver(event, index)}
             ondrop={(event) => handleDrop(event, index)}
             ondragend={handleDragEnd}
           >
@@ -343,6 +359,11 @@
     cursor: grab;
   }
   .video-list li.dragging { opacity: 0.5; }
+  .video-list li.drag-over {
+    border-color: #4255bf;
+    background: #eef1ff;
+    box-shadow: inset 3px 0 0 #4255bf;
+  }
   .video-list .index { flex: 0 0 auto; color: #344694; font-weight: 700; }
   .video-list .name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
   .video-list button { padding: 6px 9px; font-size: 0.78rem; }
@@ -364,7 +385,7 @@
   button:focus-visible { outline: 3px solid #8597f1; outline-offset: 3px; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .primary { width: 100%; margin-top: 20px; background: #4255bf; border-color: #4255bf; color: white; }
-  .primary:hover:not(:disabled) { background: #3345a8; }
+  .primary:hover:not(:disabled) { background: #3345a8; color: #ffffff; }
   .running { display: flex; align-items: center; gap: 10px; margin-top: 16px; color: #344694; font-size: 0.9rem; }
   .running .cancel {
     margin-left: auto;

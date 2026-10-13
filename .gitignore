@@ -8,4 +8,8 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
-src-tauri/binaries/
+# Tauri FFmpeg sidecars are large prebuilt binaries; keep them out of git to
+# avoid bloating the remote. Naming: binaries/univ-ffmpeg-<target-triple>[.exe]
+# (ffprobe is intentionally not bundled; probing uses univ-ffmpeg -i)
+src-tauri/binaries/*
+!src-tauri/binaries/README.md
