@@ -47,7 +47,10 @@ describe("NoticeAndSupportModal", () => {
     expect(target.querySelector("[data-testid='link-github']")).toBeNull();
     expect(openUrlMock).not.toHaveBeenCalled();
     const extension = target.querySelector<HTMLButtonElement>("[data-testid='link-extension']")!;
-    expect(extension.textContent).toBe("강의영상 다운로더 (Chrome 확장프로그램)");
+    expect(target.querySelector("[data-testid='faq-card']")?.textContent).toContain(
+      "LMS 강의영상 다운로드는 어디서 하나요?",
+    );
+    expect(extension.textContent).toBe("Chrome 웹스토어에서 다운로더 설치하기");
     extension.click();
     await vi.waitFor(() =>
       expect(openUrlMock).toHaveBeenCalledWith(
@@ -64,6 +67,10 @@ describe("NoticeAndSupportModal", () => {
 
   it("renders the donation QR card and falls back when the image fails", () => {
     tab("커피").click();
+    flushSync();
+    expect(tab("커피").textContent).toContain("💖");
+    expect(tab("커피").classList.contains("coffee-tab")).toBe(true);
+    expect(target.querySelector("[data-testid='coffee-badge']")?.textContent).toBe("커피 한 잔 선물하기 💖");
     flushSync();
     const card = target.querySelector("[data-testid='qr-card']")!;
     expect(card.textContent).toContain("스마트폰 카메라나 카카오톡으로 스캔해 주세요");
